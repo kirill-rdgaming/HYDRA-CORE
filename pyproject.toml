@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hydra7"
+version = "1.0.0"
+description = "HYDRA7 - Secure mesh network with built-in DPI evasion and multi-hop routing"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+keywords = ["proxy", "mesh-network", "security", "dpi-evasion", "socks5", "vpn"]
+authors = [
+    {name = "HYDRA Development Team"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: Security",
+    "Topic :: System :: Networking",
+]
+
+dependencies = [
+    "cryptography>=41.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+]
+performance = [
+    "uvloop>=0.17.0; sys_platform != 'win32'",
+]
+
+[project.urls]
+Homepage = "https://github.com/kirill-rdgaming/HYDRA-CORE"
+Repository = "https://github.com/kirill-rdgaming/HYDRA-CORE"
+Issues = "https://github.com/kirill-rdgaming/HYDRA-CORE/issues"
+
+[project.scripts]
+hydra7 = "hydra7.cli:main"
+
+[tool.setuptools]
+packages = ["hydra7"]
+
+[tool.setuptools.package-data]
+hydra7 = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
