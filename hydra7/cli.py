@@ -1,6 +1,3 @@
-"""
-Command-line interface for HYDRA7 mesh network node.
-"""
 
 import argparse
 import asyncio
@@ -13,7 +10,6 @@ from hydra7.core import HydraNode
 
 
 def setup_logging(verbose: bool = False):
-    """Configure logging based on verbosity level."""
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -23,7 +19,6 @@ def setup_logging(verbose: bool = False):
 
 
 def main():
-    """Main entry point for the HYDRA7 CLI."""
     parser = argparse.ArgumentParser(
         prog="hydra7",
         description="HYDRA7 - Secure Mesh Network with DPI Evasion",
@@ -66,6 +61,13 @@ def main():
     )
     
     parser.add_argument(
+        "--sni",
+        type=str,
+        metavar="DOMAIN",
+        help="SNI domain for TLS camouflage (e.g., google.com) (or set HYDRA_SNI env var)"
+    )
+    
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging (DEBUG level)"
@@ -73,10 +75,8 @@ def main():
     
     args = parser.parse_args()
     
-    # Setup logging
     setup_logging(verbose=args.verbose)
     
-    # Set environment variables from CLI args if provided
     if args.port:
         os.environ["HYDRA_PORT"] = str(args.port)
     
@@ -86,20 +86,19 @@ def main():
     if args.seeds:
         os.environ["HYDRA_SEEDS"] = args.seeds
     
-    # Override SOCKS port constant if specified
+    if args.sni:
+        os.environ["HYDRA_SNI"] = args.sni
+    
     if args.socks_port != 1080:
         import hydra7.core
         hydra7.core.SOCKS_PORT = args.socks_port
     
-    # Print banner
     print("\033[96m" + "=" * 60 + "\033[0m")
     print(f"\033[96m  HYDRA7 v{__version__} - Secure Mesh Network\033[0m")
     print("\033[96m" + "=" * 60 + "\033[0m")
     print()
     
-    # Create and start the node
     try:
-        # Check for uvloop on non-Windows systems
         if os.name != 'nt':
             try:
                 import uvloop

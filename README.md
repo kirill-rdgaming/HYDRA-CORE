@@ -108,12 +108,13 @@ The following classes and functions are available in the public API:
 - `HYDRA_SECRET`: Network shared secret (default: auto-generated)
 - `HYDRA_PORT`: Override default port (default: derived from secret)
 - `HYDRA_SEEDS`: Comma-separated list of seed nodes (IP:PORT format)
+- `HYDRA_SNI`: SNI domain for TLS camouflage to bypass DPI (optional)
 
 ### Command-Line Options
 
 ```
 usage: hydra7 [-h] [--version] [--port PORT] [--secret SECRET] 
-              [--seeds SEEDS] [--socks-port PORT] [-v]
+              [--seeds SEEDS] [--socks-port PORT] [--sni DOMAIN] [-v]
 
 HYDRA7 - Secure Mesh Network with DPI Evasion
 
@@ -124,8 +125,32 @@ optional arguments:
   --secret SECRET       Network secret key (or set HYDRA_SECRET env var)
   --seeds SEEDS         Comma-separated list of seed nodes (IP:PORT)
   --socks-port PORT     Local SOCKS5 proxy port (default: 1080)
+  --sni DOMAIN          SNI domain for TLS camouflage (e.g., google.com)
   -v, --verbose         Enable verbose logging (DEBUG level)
 ```
+
+### TLS Camouflage (Advanced DPI Bypass)
+
+HYDRA7 includes a sophisticated TLS camouflage feature that disguises mesh traffic as legitimate HTTPS connections to bypass SNI-based filtering and strict censorship:
+
+```bash
+# Disguise traffic as HTTPS to google.com
+hydra7 --sni google.com
+
+# Or use environment variable
+export HYDRA_SNI=cloudflare.com
+hydra7
+```
+
+**Features:**
+- Support for TLS 1.3, 1.2, 1.1, 1.0, and SSL 3.0
+- Realistic browser fingerprints (Chrome, Firefox, Safari)
+- GREASE values to prevent TLS ossification detection
+- Complete handshake simulation with fake certificates
+- Traffic fragmentation and timing jitter for maximum realism
+- Makes traffic **indistinguishable** from real HTTPS connections
+
+This makes connections appear as normal HTTPS traffic to whitelisted domains, effectively bypassing SNI-based filtering.
 
 ## How It Works
 
