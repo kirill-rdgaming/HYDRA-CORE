@@ -247,11 +247,12 @@ class TlsCamouflage:
         self.client_random = struct.pack("!I", int(time.time())) + os.urandom(28)
         self.server_random = struct.pack("!I", int(time.time())) + os.urandom(28)
         
-        random.shuffle(self.GREASE_VALUES)
-        self.grease_cipher = self.GREASE_VALUES[0]
-        self.grease_extension = self.GREASE_VALUES[1]
-        self.grease_group = self.GREASE_VALUES[2]
-        self.grease_version = self.GREASE_VALUES[3]
+        grease_values = self.GREASE_VALUES.copy()
+        random.shuffle(grease_values)
+        self.grease_cipher = grease_values[0]
+        self.grease_extension = grease_values[1]
+        self.grease_group = grease_values[2]
+        self.grease_version = grease_values[3]
         
         self.record_size_distribution = [256, 512, 1024, 2048, 4096, 8192, 16384]
         self.timing_jitter_ms = (10, 100)
@@ -671,10 +672,10 @@ class TlsCamouflage:
             fragment_len = struct.unpack("!H", data[offset + 3:offset + 5])[0]
             
             if content_type != self.CONTENT_TYPE_APPLICATION_DATA:
-                raise ValueError(f"Expected Application Data, got {content_type}")
+                raise ValueError("Invalid record type")
             
             if len(data) - offset < 5 + fragment_len:
-                raise ValueError("Incomplete TLS record")
+                raise ValueError("Incomplete record")
             
             fragment = data[offset + 5:offset + 5 + fragment_len]
             result += fragment
@@ -840,7 +841,7 @@ class SecureSocket:
         
         self.tls_camouflage = None
         if SNI_DOMAIN:
-            browser = random.choice(['chrome', 'firefox', 'safari'])
+            browser = random.choice(list(TlsCamouflage.BROWSER_PROFILES.keys()))
             self.tls_camouflage = TlsCamouflage(SNI_DOMAIN, version="1.3", browser=browser)
         
         try:
@@ -892,6 +893,11 @@ class SecureSocket:
                     tls_head = await self.r.readexactly(5)
                     content_type = tls_head[0]
                     tls_len = struct.unpack("!H", tls_head[3:5])[0]
+                    
+                    if tls_len > MAX_FRAME_SIZE:
+                        log.error(f"Oversized TLS record ({tls_len} bytes) from {self.peer_addr}")
+                        await metrics.record_error("oversized_tls_record")
+                        raise ValueError(f"TLS record size {tls_len} exceeds maximum")
                     
                     tls_body = await self.r.readexactly(tls_len)
                     tls_data = tls_head + tls_body
@@ -1040,6 +1046,12 @@ class SecureSocket:
                 tls_header = first_byte + remaining_header
                 
                 tls_len = struct.unpack("!H", tls_header[3:5])[0]
+                
+                if tls_len > MAX_FRAME_SIZE:
+                    log.error(f"Oversized TLS handshake ({tls_len} bytes)")
+                    await metrics.record_error("oversized_tls_handshake")
+                    raise ValueError(f"TLS handshake size {tls_len} exceeds maximum")
+                
                 tls_body = await self.r.readexactly(tls_len)
                 client_hello = tls_header + tls_body
                 
