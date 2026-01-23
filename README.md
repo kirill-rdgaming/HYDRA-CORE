@@ -141,7 +141,7 @@ optional arguments:
 - The secret must be shared among all nodes in the network
 - Network traffic is encrypted end-to-end
 - Handshakes are obfuscated to prevent DPI detection
-- Automatic replay protection with timestamp validation (±60 seconds)
+- Automatic replay protection with timestamp validation (±30 seconds)
 
 ## Requirements
 
