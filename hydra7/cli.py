@@ -66,6 +66,13 @@ def main():
     )
     
     parser.add_argument(
+        "--sni",
+        type=str,
+        metavar="DOMAIN",
+        help="SNI domain for TLS camouflage (e.g., google.com) (or set HYDRA_SNI env var)"
+    )
+    
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose logging (DEBUG level)"
@@ -85,6 +92,9 @@ def main():
     
     if args.seeds:
         os.environ["HYDRA_SEEDS"] = args.seeds
+    
+    if args.sni:
+        os.environ["HYDRA_SNI"] = args.sni
     
     # Override SOCKS port constant if specified
     if args.socks_port != 1080:
