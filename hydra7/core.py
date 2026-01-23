@@ -8,7 +8,9 @@ import random
 import time
 import logging
 import sys
-from typing import Optional, Dict, List, Tuple
+import signal
+from typing import Optional, Dict, List, Tuple, Any
+from datetime import datetime
 
 # --- [ CRITICAL DEPENDENCIES CHECK ] ---
 try:
@@ -24,20 +26,30 @@ except ImportError:
 # --- [ CONFIGURATION ] ---
 # The Shared Secret. MUST match on all nodes to bypass DPI.
 NETWORK_SECRET = os.getenv("HYDRA_SECRET", "Proprietary_Mesh_Key_V7_Genius")
+
+# Validate secret strength
+if len(NETWORK_SECRET) < 16:
+    print("\033[91m[SECURITY WARNING] NETWORK_SECRET should be at least 16 characters!\033[0m")
+    print("\033[91mUsing weak secret compromises the entire network security.\033[0m")
+
 PORT_OVERRIDE = int(os.getenv("HYDRA_PORT", 0))
 
 # Seed Nodes: "IP:Port" (Comma separated).
 # Example: export HYDRA_SEEDS="145.2.3.4:25000,89.1.2.3:25000"
 SEEDS = [s.strip() for s in os.getenv("HYDRA_SEEDS", "").split(",") if s.strip()]
 
-# Constants
-SOCKS_PORT = 1080
-HYDRA_PORT_BASE = 25000
-MAX_PADDING = 256
-KEEPALIVE_INTERVAL = 15  # Seconds between heartbeats
-CONNECTION_TIMEOUT = 10
-BUFFER_SIZE = 65536
-LOG_LEVEL = logging.INFO
+# Constants with clear naming and rationale
+SOCKS_PORT = 1080  # Standard SOCKS5 port
+HYDRA_PORT_BASE = 25000  # Base port for HYDRA mesh (25000-30000 range)
+MAX_PADDING = 256  # Maximum random padding to frustrate traffic analysis
+KEEPALIVE_INTERVAL = 15  # Seconds between heartbeats (keep tunnels alive)
+CONNECTION_TIMEOUT = 10  # Seconds to wait for connection establishment
+BUFFER_SIZE = 65536  # 64KB buffer for data transfer
+LOG_LEVEL = logging.INFO  # Default log level
+TIMESTAMP_WINDOW = 30  # Seconds of clock skew tolerance (reduced from 60 for security)
+MAX_FRAME_SIZE = BUFFER_SIZE + 1024  # Maximum frame size to prevent memory exhaustion
+MAX_CONCURRENT_CONNECTIONS = 1000  # Maximum concurrent connections per node
+IDLE_CONNECTION_TIMEOUT = 300  # Close idle connections after 5 minutes
 
 # STUN Servers for WAN IP discovery
 STUN_SERVERS = [
@@ -57,6 +69,94 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 log = logging.getLogger("HYDRA")
+
+# --- [ METRICS & MONITORING ] ---
+class Metrics:
+    """
+    Simple metrics collection for monitoring HYDRA7 node health and performance.
+    Tracks connections, bytes transferred, errors, and peer statistics.
+    """
+    def __init__(self):
+        self.connections_total = 0
+        self.connections_active = 0
+        self.connections_failed = 0
+        self.bytes_sent = 0
+        self.bytes_received = 0
+        self.frames_sent = 0
+        self.frames_received = 0
+        self.errors_total = 0
+        self.peers_discovered = 0
+        self.uptime_start = time.time()
+        self.lock = asyncio.Lock()
+    
+    async def record_connection(self, success: bool = True):
+        """Record a connection attempt"""
+        async with self.lock:
+            self.connections_total += 1
+            if success:
+                self.connections_active += 1
+            else:
+                self.connections_failed += 1
+    
+    async def record_disconnect(self):
+        """Record a disconnection"""
+        async with self.lock:
+            if self.connections_active > 0:
+                self.connections_active -= 1
+    
+    async def record_data(self, bytes_sent: int = 0, bytes_recv: int = 0):
+        """Record data transfer"""
+        async with self.lock:
+            self.bytes_sent += bytes_sent
+            self.bytes_received += bytes_recv
+    
+    async def record_frame(self, sent: bool = True):
+        """Record frame processed"""
+        async with self.lock:
+            if sent:
+                self.frames_sent += 1
+            else:
+                self.frames_received += 1
+    
+    async def record_error(self, error_type: str = "unknown"):
+        """Record an error"""
+        async with self.lock:
+            self.errors_total += 1
+            log.debug(f"Error recorded: {error_type}")
+    
+    async def record_peer_discovered(self):
+        """Record peer discovery"""
+        async with self.lock:
+            self.peers_discovered += 1
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current statistics"""
+        uptime = int(time.time() - self.uptime_start)
+        return {
+            'uptime_seconds': uptime,
+            'connections_total': self.connections_total,
+            'connections_active': self.connections_active,
+            'connections_failed': self.connections_failed,
+            'bytes_sent': self.bytes_sent,
+            'bytes_received': self.bytes_received,
+            'frames_sent': self.frames_sent,
+            'frames_received': self.frames_received,
+            'errors_total': self.errors_total,
+            'peers_discovered': self.peers_discovered,
+        }
+    
+    def log_stats(self):
+        """Log current statistics"""
+        stats = self.get_stats()
+        log.info(f"Stats: Active Conns={stats['connections_active']}, "
+                f"Total Conns={stats['connections_total']}, "
+                f"Sent={stats['bytes_sent']//1024}KB, "
+                f"Recv={stats['bytes_received']//1024}KB, "
+                f"Errors={stats['errors_total']}, "
+                f"Uptime={stats['uptime_seconds']}s")
+
+# Global metrics instance
+metrics = Metrics()
 
 # --- [ CRYPTO CORE ] ---
 class Obfuscator:
@@ -100,6 +200,8 @@ class SessionCrypto:
         self.rx_cipher = None
         self.tx_nonce = 0
         self.rx_nonce = 0
+        self.tx_lock = asyncio.Lock()
+        self.rx_lock = asyncio.Lock()
 
     def get_pub_bytes(self) -> bytes:
         return self.pub_key.public_bytes(
@@ -130,20 +232,40 @@ class SessionCrypto:
             self.tx_cipher = ChaCha20Poly1305(keys[32:])
             self.rx_cipher = ChaCha20Poly1305(keys[:32])
 
-    def encrypt(self, data: bytes) -> bytes:
-        nonce = struct.pack("!Q", self.tx_nonce).rjust(12, b'\x00')
-        self.tx_nonce += 1
-        return self.tx_cipher.encrypt(nonce, data, None)
+    async def encrypt(self, data: bytes) -> bytes:
+        async with self.tx_lock:
+            # Check for nonce overflow (2^64 limit)
+            if self.tx_nonce >= (2**64 - 1):
+                raise ValueError("Nonce overflow - session must be renegotiated")
+            nonce = struct.pack("!Q", self.tx_nonce).rjust(12, b'\x00')
+            self.tx_nonce += 1
+            return self.tx_cipher.encrypt(nonce, data, None)
 
-    def decrypt(self, data: bytes) -> bytes:
-        nonce = struct.pack("!Q", self.rx_nonce).rjust(12, b'\x00')
-        self.rx_nonce += 1
-        return self.rx_cipher.decrypt(nonce, data, None)
+    async def decrypt(self, data: bytes) -> bytes:
+        async with self.rx_lock:
+            # Check for nonce overflow (2^64 limit)
+            if self.rx_nonce >= (2**64 - 1):
+                raise ValueError("Nonce overflow - session must be renegotiated")
+            nonce = struct.pack("!Q", self.rx_nonce).rjust(12, b'\x00')
+            self.rx_nonce += 1
+            return self.rx_cipher.decrypt(nonce, data, None)
 
 # --- [ TRANSPORT LAYER ] ---
 class SecureSocket:
     """
-    Handles Framing, Encryption, Padding, and Heartbeats.
+    Handles Framing, Encryption, Padding, and Heartbeats for secure communication.
+    
+    Features:
+    - Encrypted frames using ChaCha20-Poly1305
+    - Random padding for traffic analysis resistance  
+    - Automatic heartbeats to keep connections alive
+    - Nonce-based replay protection
+    
+    Frame Format:
+        [FrameLen:2 bytes][Encrypted Payload]
+        
+    Payload Format (after decryption):
+        [DataLen:2 bytes][Data][Random Padding]
     """
     def __init__(self, reader, writer, crypto):
         self.r = reader
@@ -152,6 +274,13 @@ class SecureSocket:
         self.obf = Obfuscator()
         self._closed = False
         self.last_activity = time.time()
+        self.peer_addr = None
+        
+        # Get peer address for logging
+        try:
+            self.peer_addr = writer.get_extra_info('peername')
+        except:
+            self.peer_addr = "unknown"
         
         # OS Level Optimization
         sock = writer.get_extra_info('socket')
@@ -159,9 +288,11 @@ class SecureSocket:
             try:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            except: pass
+            except Exception as e:
+                log.debug(f"Failed to set socket options: {e}")
 
     async def send_frame(self, data: bytes):
+        """Send an encrypted frame with padding"""
         if self._closed: return
         try:
             # Padding to frustrate traffic analysis
@@ -171,53 +302,111 @@ class SecureSocket:
             
             # Payload: [Len:2][Data][Padding]
             payload = struct.pack("!H", dlen) + data + padding
-            encrypted = self.c.encrypt(payload)
+            encrypted = await self.c.encrypt(payload)
             
             # Frame: [FrameLen:2][EncryptedBody]
             frame = struct.pack("!H", len(encrypted)) + encrypted
             self.w.write(frame)
             await self.w.drain()
             self.last_activity = time.time()
-        except Exception:
+            
+            # Record metrics
+            await metrics.record_frame(sent=True)
+            await metrics.record_data(bytes_sent=len(frame))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"Send frame failed to {self.peer_addr}: {e}")
+            await metrics.record_error("send_frame_failed")
             await self.close()
             raise
 
     async def recv_frame(self) -> Optional[bytes]:
         """
         Reads a frame, handles Heartbeats transparently.
-        Returns None on disconnect.
+        Returns None on disconnect or error.
+        
+        Raises:
+            ValueError: Frame size exceeds maximum allowed
+            asyncio.TimeoutError: Read operation timed out
         """
         while not self._closed:
             try:
-                # 1. Read Frame Length
-                head = await self.r.readexactly(2)
+                # 1. Read Frame Length with timeout to prevent hangs
+                try:
+                    async with asyncio.timeout(CONNECTION_TIMEOUT):
+                        head = await self.r.readexactly(2)
+                except asyncio.TimeoutError:
+                    log.warning(f"Read timeout from {self.peer_addr}")
+                    await metrics.record_error("read_timeout")
+                    await self.close()
+                    return None
+                
                 cipher_len = struct.unpack("!H", head)[0]
                 
-                # Sanity check
-                if cipher_len > BUFFER_SIZE + 1024:
-                    raise ValueError("Oversized Frame")
+                # Sanity check against maximum frame size
+                if cipher_len > MAX_FRAME_SIZE:
+                    log.error(f"Oversized frame ({cipher_len} bytes) from {self.peer_addr}")
+                    await metrics.record_error("oversized_frame")
+                    raise ValueError(f"Frame size {cipher_len} exceeds maximum {MAX_FRAME_SIZE}")
 
-                # 2. Read Ciphertext
-                ciphertext = await self.r.readexactly(cipher_len)
+                # 2. Read Ciphertext with timeout
+                try:
+                    async with asyncio.timeout(CONNECTION_TIMEOUT):
+                        ciphertext = await self.r.readexactly(cipher_len)
+                except asyncio.TimeoutError:
+                    log.warning(f"Read timeout waiting for frame body from {self.peer_addr}")
+                    await metrics.record_error("read_timeout")
+                    await self.close()
+                    return None
                 
                 # 3. Decrypt
-                plaintext = self.c.decrypt(ciphertext)
+                try:
+                    plaintext = await self.c.decrypt(ciphertext)
+                except Exception as e:
+                    log.warning(f"Decryption failed from {self.peer_addr}: {e}")
+                    await metrics.record_error("decryption_failed")
+                    await self.close()
+                    return None
                 
-                # 4. Parse Inner
+                # 4. Parse Inner payload
+                if len(plaintext) < 2:
+                    log.warning(f"Invalid frame format from {self.peer_addr}")
+                    await metrics.record_error("invalid_frame")
+                    await self.close()
+                    return None
+                    
                 real_len = struct.unpack("!H", plaintext[:2])[0]
+                if real_len > len(plaintext) - 2:
+                    log.warning(f"Frame data length mismatch from {self.peer_addr}")
+                    await metrics.record_error("invalid_frame")
+                    await self.close()
+                    return None
+                    
                 data = plaintext[2:2+real_len]
+                
+                # Record metrics
+                await metrics.record_frame(sent=False)
+                await metrics.record_data(bytes_recv=len(head) + cipher_len)
+                self.last_activity = time.time()
                 
                 # Handle Internal Commands (Heartbeat)
                 if len(data) == 1 and data[0] == 0x02: # HEARTBEAT_ACK
+                    log.debug(f"Heartbeat received from {self.peer_addr}")
                     continue
                 
                 return data
 
-            except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
+            except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError) as e:
+                log.debug(f"Connection closed from {self.peer_addr}: {e}")
+                await metrics.record_error("connection_closed")
                 await self.close()
                 return None
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                log.debug(f"Transport Error: {e}")
+                log.warning(f"Transport error from {self.peer_addr}: {e}")
+                await metrics.record_error("transport_error")
                 await self.close()
                 return None
 
@@ -225,7 +414,10 @@ class SecureSocket:
         if self._closed: return
         try:
             await self.send_frame(b'\x02')
-        except: pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
     async def handshake_init(self) -> bool:
         """Client-side Handshake"""
@@ -292,29 +484,43 @@ class SecureSocket:
             auth_frame = await self.recv_frame()
             if not auth_frame: return False
             
+            if len(auth_frame) < 40:  # 8 bytes timestamp + 32 bytes SHA256
+                log.warning(f"Auth Failed: Invalid frame length from {self.peer_addr}")
+                await metrics.record_error("auth_invalid_frame")
+                return False
+            
             ts = struct.unpack("!Q", auth_frame[:8])[0]
             proof = auth_frame[8:]
             
-            # Replay Window +/- 60s
-            if abs(time.time() - ts) > 60:
-                log.warning("Auth Failed: Replay/Clock Skew")
+            # Tighter replay window (reduced from 60s to 30s for better security)
+            time_diff = abs(time.time() - ts)
+            if time_diff > TIMESTAMP_WINDOW:
+                log.warning(f"Auth Failed: Timestamp outside window ({time_diff:.1f}s) from {self.peer_addr}")
+                await metrics.record_error("auth_replay_window")
                 return False
             
             expected = hashlib.sha256(NETWORK_SECRET.encode() + auth_frame[:8]).digest()
             if proof != expected:
-                log.warning("Auth Failed: Wrong Secret")
+                log.warning(f"Auth Failed: Wrong secret from {self.peer_addr}")
+                await metrics.record_error("auth_wrong_secret")
                 return False
-                
+            
+            log.debug(f"Handshake successful with {self.peer_addr}")
             return True
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            log.debug(f"Handshake Resp Failed: {e}")
+            log.warning(f"Handshake Resp Failed from {self.peer_addr}: {e}")
+            await metrics.record_error("handshake_failed")
             await self.close()
             return False
 
     async def close(self):
+        """Close the secure socket and clean up resources"""
         if self._closed: return
         self._closed = True
         try:
+            await metrics.record_disconnect()
             self.w.close()
             await self.w.wait_closed()
         except: pass
@@ -400,36 +606,81 @@ class StunClient:
                 sock.sendto(req, (server, port))
                 
                 resp, _ = sock.recvfrom(2048)
-                sock.close()
                 
                 # Parse Mapped Address (IPv4 only logic for simplicity)
                 # Header(20) -> Attributes
-                if len(resp) < 20: continue
+                if len(resp) < 20: 
+                    sock.close()
+                    continue
                 
                 idx = 20
                 while idx < len(resp):
+                    if idx + 4 > len(resp):
+                        break
                     atype = struct.unpack("!H", resp[idx:idx+2])[0]
                     alen = struct.unpack("!H", resp[idx+2:idx+4])[0]
                     idx += 4
                     
                     if atype == 0x0001: # Mapped Address
+                        if idx + alen > len(resp):
+                            break
                         family = resp[idx+1]
                         if family == 0x01: # IPv4
-                            ip = socket.inet_ntoa(resp[idx+4:idx+8])
-                            return ip
+                            if idx + 8 <= len(resp):
+                                ip = socket.inet_ntoa(resp[idx+4:idx+8])
+                                sock.close()
+                                return ip
                     idx += alen
-            except Exception:
                 sock.close()
+            except Exception:
+                try:
+                    sock.close()
+                except:
+                    pass
                 continue
         return None
 
 # --- [ NODE LOGIC ] ---
 class HydraNode:
+    """
+    Main HYDRA7 node that coordinates all mesh network operations.
+    
+    Responsibilities:
+    - Start and manage transport servers (HYDRA tunnel + SOCKS5 proxy)
+    - Perform peer discovery and exchange
+    - Route traffic through the mesh network
+    - Monitor node health and connectivity
+    """
     def __init__(self):
         self.port = self._get_port()
         self.peers = PeerManager(self.port)
         self.stun = StunClient()
         self.running = True
+        self.shutdown_event = asyncio.Event()
+        
+        # Setup signal handlers for graceful shutdown
+        self._setup_signal_handlers()
+
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for graceful shutdown"""
+        try:
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self._shutdown(s)))
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            pass
+        except Exception as e:
+            log.debug(f"Could not setup signal handlers: {e}")
+    
+    async def _shutdown(self, sig):
+        """Handle shutdown signal gracefully"""
+        log.info(f"\n\033[93m[SHUTDOWN] Received signal {sig}, initiating graceful shutdown...\033[0m")
+        self.running = False
+        self.shutdown_event.set()
+        
+        # Log final statistics
+        metrics.log_stats()
 
     def _get_port(self):
         if PORT_OVERRIDE > 0: return PORT_OVERRIDE
@@ -440,12 +691,19 @@ class HydraNode:
     async def start(self):
         print(f"\033[96m[HYDRA v7] Starting on 0.0.0.0:{self.port}...\033[0m")
         print(f"Secret Hash: {hashlib.sha256(NETWORK_SECRET.encode()).hexdigest()[:8]}")
+        
+        # Display configuration
+        log.info(f"Configuration: Max Connections={MAX_CONCURRENT_CONNECTIONS}, "
+                f"Timeout={CONNECTION_TIMEOUT}s, Timestamp Window={TIMESTAMP_WINDOW}s")
 
         # 1. Start Transport Servers
         try:
             srv = await asyncio.start_server(self.handle_tunnel, '0.0.0.0', self.port)
             socks = await asyncio.start_server(self.handle_socks, '127.0.0.1', SOCKS_PORT)
+            log.info(f"HYDRA tunnel listening on 0.0.0.0:{self.port}")
+            log.info(f"SOCKS5 proxy listening on 127.0.0.1:{SOCKS_PORT}")
         except OSError as e:
+            log.error(f"Port bind failed: {e}")
             print(f"\033[91m[ERROR] Port bind failed: {e}\033[0m")
             return
 
@@ -458,35 +716,59 @@ class HydraNode:
             log.warning("STUN Failed. Entering Bunker Mode (Hidden Node).")
             self.peers.bunker_mode = True
 
-        # 3. Tasks
+        # 3. Start background tasks
         tasks = [
             self.run_server(srv),
             self.run_server(socks),
             self.task_connectivity_check(),
             self.task_pex(),
-            self.task_cleanup()
+            self.task_cleanup(),
+            self.task_stats_logger(),  # New task for periodic stats logging
         ]
+
+        log.info("\033[92m[READY] Node initialized and ready to serve\033[0m")
 
         try:
             await asyncio.gather(*tasks)
         except KeyboardInterrupt:
-            print("\nShutting down.")
+            log.info("\nReceived interrupt, shutting down...")
+            self.running = False
+        finally:
+            # Final cleanup
+            log.info("Node stopped")
+            metrics.log_stats()
 
     async def run_server(self, srv):
+        """Run a server until shutdown"""
         async with srv:
-            await srv.serve_forever()
+            try:
+                await srv.serve_forever()
+            except asyncio.CancelledError:
+                log.debug("Server task cancelled")
 
     # --- BACKGROUND TASKS ---
+    async def task_stats_logger(self):
+        """Periodically log node statistics"""
+        while self.running:
+            await asyncio.sleep(60)  # Log stats every minute
+            if self.running:
+                metrics.log_stats()
+    
     async def task_connectivity_check(self):
-        """Am I an Exit Node?"""
+        """Check if this node can act as an Exit Node"""
         while self.running:
             success = False
             for h, p in CHECK_TARGETS:
                 try:
                     r, w = await asyncio.wait_for(asyncio.open_connection(h, p), 5)
-                    w.close(); await w.wait_closed()
-                    success = True; break
-                except: pass
+                    w.close()
+                    await w.wait_closed()
+                    success = True
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.debug(f"Connectivity check failed for {h}:{p}: {e}")
             
             # State Transition Logic
             if success and not self.peers.am_i_exit:
@@ -581,9 +863,14 @@ class HydraNode:
                 
                 # 0x01: CONNECT (Proxy)
                 if cmd == 0x01:
+                    # Validate frame length
+                    if len(frame) < 2:
+                        break
                     hlen = frame[1]
+                    if len(frame) < 2 + hlen + 2:
+                        break
                     host = frame[2:2+hlen].decode()
-                    port = struct.unpack("!H", frame[2+hlen:])[0]
+                    port = struct.unpack("!H", frame[2+hlen:2+hlen+2])[0]
                     
                     if self.peers.am_i_exit:
                         await self.run_exit(ss, host, port)
@@ -626,7 +913,9 @@ class HydraNode:
             
         except Exception:
             await client_ss.send_frame(b'\xFF') # Error
-            if target_w: target_w.close()
+            if target_w:
+                target_w.close()
+                await target_w.wait_closed()
 
     async def run_relay(self, client_ss, init_packet):
         """I am a relay. Find next hop."""
@@ -668,7 +957,10 @@ class HydraNode:
         try:
             # Auth
             ver = await r.read(1)
-            if ver != b'\x05': return
+            if ver != b'\x05':
+                w.close()
+                await w.wait_closed()
+                return
             nm = (await r.read(1))[0]
             await r.read(nm)
             w.write(b'\x05\x00'); await w.drain()
@@ -677,7 +969,9 @@ class HydraNode:
             head = await r.readexactly(4)
             cmd = head[1]
             if cmd != 1: # CONNECT only
-                w.close(); return
+                w.close()
+                await w.wait_closed()
+                return
             
             atyp = head[3]
             if atyp == 1: # IPv4
@@ -685,7 +979,10 @@ class HydraNode:
             elif atyp == 3: # Domain
                 l = (await r.readexactly(1))[0]
                 addr = (await r.readexactly(l)).decode()
-            else: w.close(); return
+            else:
+                w.close()
+                await w.wait_closed()
+                return
             
             port = struct.unpack("!H", await r.readexactly(2))[0]
             
@@ -696,7 +993,11 @@ class HydraNode:
                 await self.socks_tunnel(r, w, addr, port)
                 
         except Exception:
-            w.close()
+            try:
+                w.close()
+                await w.wait_closed()
+            except:
+                pass
 
     async def socks_direct(self, cr, cw, host, port):
         tw = None
@@ -705,8 +1006,17 @@ class HydraNode:
             cw.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00'); await cw.drain()
             await self.pipe_plain(cr, cw, tr, tw)
         except:
-            cw.close()
-            if tw: tw.close()
+            try:
+                cw.close()
+                await cw.wait_closed()
+            except:
+                pass
+            if tw:
+                tw.close()
+                try:
+                    await tw.wait_closed()
+                except:
+                    pass
 
     async def socks_tunnel(self, cr, cw, host, port):
         # Retry loop for client experience
@@ -735,7 +1045,11 @@ class HydraNode:
                 if ss: await ss.close()
         
         # Fail
-        cw.close()
+        try:
+            cw.close()
+            await cw.wait_closed()
+        except:
+            pass
 
     # --- PIPING MECHANICS (HEARTBEAT AWARE) ---
     async def keepalive_sender(self, ss: SecureSocket):
